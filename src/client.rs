@@ -69,6 +69,15 @@ impl<T: Read + Write + Unpin + fmt::Debug> AsMut<T> for Session<T> {
 #[derive(Debug)]
 pub struct Client<T: Read + Write + Unpin + fmt::Debug> {
     conn: Connection<T>,
+    // Unilateral responses received before signing in, handed over to the `Session`.
+    // Boxed to keep `Client`, which sign-in errors return, small.
+    unsolicited: Box<UnsolicitedChannel>,
+}
+
+#[derive(Debug)]
+struct UnsolicitedChannel {
+    tx: channel::Sender<UnsolicitedResponse>,
+    rx: channel::Receiver<UnsolicitedResponse>,
 }
 
 /// The underlying primitives type. Both `Client`(unauthenticated) and `Session`(after succesful
@@ -134,13 +143,30 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
     /// also be used to support IMAP over custom tunnels.
     pub fn new(stream: T) -> Client<T> {
         let stream = ImapStream::new(stream);
+        let (tx, rx) = bounded(100);
 
         Client {
             conn: Connection {
                 stream,
                 request_ids: IdGenerator::new(),
             },
+            unsolicited: Box::new(UnsolicitedChannel { tx, rx }),
         }
+    }
+
+    /// Asks the server for its capabilities before signing in.
+    ///
+    /// Unilateral responses received meanwhile are kept and delivered through
+    /// [`Session::unsolicited_responses`] after a successful sign-in.
+    pub async fn capabilities(&mut self) -> Result<Capabilities> {
+        let id = self.run_command("CAPABILITY").await?;
+        parse_capabilities(&mut self.conn.stream, self.unsolicited.tx.clone(), id).await
+    }
+
+    fn into_session(self) -> Session<T> {
+        let Self { conn, unsolicited } = self;
+        let UnsolicitedChannel { tx, rx } = *unsolicited;
+        Session::with_channel(conn, tx, rx)
     }
 
     /// Convert this Client into the raw underlying stream.
@@ -202,7 +228,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
         let u = ok_or_unauth_client_err!(validate_str(username.as_ref()), self);
         let p = ok_or_unauth_client_err!(validate_str(password.as_ref()), self);
 
-        let (unsolicited_tx, unsolicited_rx) = bounded(100);
+        let unsolicited_tx = self.unsolicited.tx.clone();
         let id = ok_or_unauth_client_err!(self.run_command(&format!("LOGIN {u} {p}")).await, self);
         loop {
             let Some(res) = ok_or_unauth_client_err!(self.stream.try_next().await, self) else {
@@ -233,8 +259,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
                     .try_send(UnsolicitedResponse::Other(res))
                     .ok();
             }
-            let session = Session::with_channel(self.conn, unsolicited_tx, unsolicited_rx);
-            return Ok((session, capabilities));
+            return Ok((self.into_session(), capabilities));
         }
     }
 
@@ -301,7 +326,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
         id: RequestId,
         mut authenticator: A,
     ) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
-        let (unsolicited_tx, unsolicited_rx) = bounded(100);
+        let unsolicited_tx = self.unsolicited.tx.clone();
         // explicit match blocks neccessary to convert error to tuple and not bind self too
         // early (see also comment on `login`)
         loop {
@@ -338,11 +363,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
                             .await,
                         self
                     );
-                    return Ok(Session::with_channel(
-                        self.conn,
-                        unsolicited_tx,
-                        unsolicited_rx,
-                    ));
+                    return Ok(self.into_session());
                 }
             }
         }
@@ -1860,6 +1881,29 @@ mod tests {
         let response = b"A0001 OK [ALERT] Maintenance tonight\r\n".to_vec();
         let mut session = mock_session!(MockStream::new(response));
         session.run_command_and_check_ok("NOOP").await.unwrap();
+        assert_eq!(alerts(&session), ["Maintenance tonight"]);
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn client_capabilities_before_login() {
+        let response = b"* OK [ALERT] Maintenance tonight\r\n\
+                         * CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN\r\n\
+                         A0001 OK CAPABILITY completed\r\n\
+                         A0002 OK Logged in\r\n"
+            .to_vec();
+        let mut client = mock_client!(MockStream::new(response));
+        let capabilities = client.capabilities().await.unwrap();
+        assert!(capabilities.has(&Capability::Imap4rev1));
+        assert!(capabilities.has_str("STARTTLS"));
+        assert!(capabilities.has(&Capability::Auth("PLAIN".to_string())));
+        let session = client.login("username", "password").await.ok().unwrap();
+        assert_eq_bytes!(
+            &session.stream.inner.written_buf,
+            b"A0001 CAPABILITY\r\nA0002 LOGIN \"username\" \"password\"\r\n",
+            "Invalid commands"
+        );
         assert_eq!(alerts(&session), ["Maintenance tonight"]);
     }
 
