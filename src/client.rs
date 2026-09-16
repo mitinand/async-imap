@@ -202,37 +202,39 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
         let u = ok_or_unauth_client_err!(validate_str(username.as_ref()), self);
         let p = ok_or_unauth_client_err!(validate_str(password.as_ref()), self);
 
+        let (unsolicited_tx, unsolicited_rx) = bounded(100);
         let id = ok_or_unauth_client_err!(self.run_command(&format!("LOGIN {u} {p}")).await, self);
         loop {
             let Some(res) = ok_or_unauth_client_err!(self.stream.try_next().await, self) else {
                 return Err((Error::ConnectionLost, self));
             };
 
-            if let Response::Done {
-                status,
-                code,
-                information,
-                tag,
-            } = res.parsed()
-                && *tag == id
-            {
-                ok_or_unauth_client_err!(
+            let completion = match res.parsed() {
+                Response::Done {
+                    status,
+                    code,
+                    information,
+                    tag,
+                } if *tag == id => Some((
                     self.check_status_ok(status, code.as_ref(), information.as_deref()),
-                    self
-                );
-
-                let capabilities =
-                    if let Some(imap_proto::types::ResponseCode::Capabilities(capabilities)) = code
-                    {
-                        use crate::types::{Capabilities, Capability};
-                        let capability_set: HashSet<Capability> =
-                            capabilities.iter().map(Capability::from).collect();
-                        Some(Capabilities(capability_set))
-                    } else {
-                        None
-                    };
-                return Ok((Session::new(self.conn), capabilities));
+                    capabilities_from_code(code.as_ref()),
+                    matches!(code, Some(imap_proto::ResponseCode::Alert)),
+                )),
+                _ => None,
+            };
+            let Some((status, capabilities, alert)) = completion else {
+                // Keep unilateral responses, such as ALERTs, for the session.
+                handle_unilateral(res, unsolicited_tx.clone());
+                continue;
+            };
+            ok_or_unauth_client_err!(status, self);
+            if alert {
+                unsolicited_tx
+                    .try_send(UnsolicitedResponse::Other(res))
+                    .ok();
             }
+            let session = Session::with_channel(self.conn, unsolicited_tx, unsolicited_rx);
+            return Ok((session, capabilities));
         }
     }
 
@@ -299,6 +301,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
         id: RequestId,
         mut authenticator: A,
     ) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
+        let (unsolicited_tx, unsolicited_rx) = bounded(100);
         // explicit match blocks neccessary to convert error to tuple and not bind self too
         // early (see also comment on `login`)
         loop {
@@ -330,8 +333,16 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
                     );
                 }
                 _ => {
-                    ok_or_unauth_client_err!(self.check_done_ok_from(&id, None, res).await, self);
-                    return Ok(Session::new(self.conn));
+                    ok_or_unauth_client_err!(
+                        self.check_done_ok_from(&id, Some(unsolicited_tx.clone()), res)
+                            .await,
+                        self
+                    );
+                    return Ok(Session::with_channel(
+                        self.conn,
+                        unsolicited_tx,
+                        unsolicited_rx,
+                    ));
                 }
             }
         }
@@ -346,12 +357,21 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     }
 
     // not public, just to avoid duplicating the channel creation code
+    #[cfg(test)]
     fn new(conn: Connection<T>) -> Self {
         let (tx, rx) = bounded(100);
+        Self::with_channel(conn, tx, rx)
+    }
+
+    fn with_channel(
+        conn: Connection<T>,
+        unsolicited_responses_tx: channel::Sender<UnsolicitedResponse>,
+        unsolicited_responses: channel::Receiver<UnsolicitedResponse>,
+    ) -> Self {
         Session {
             conn,
-            unsolicited_responses: rx,
-            unsolicited_responses_tx: tx,
+            unsolicited_responses,
+            unsolicited_responses_tx,
         }
     }
 
@@ -1461,18 +1481,26 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
         mut response: ResponseData,
     ) -> Result<()> {
         loop {
-            if let Response::Done {
-                status,
-                code,
-                information,
-                tag,
-            } = response.parsed()
-            {
-                self.check_status_ok(status, code.as_ref(), information.as_deref())?;
-
-                if tag == id {
-                    return Ok(());
+            let completion = match response.parsed() {
+                Response::Done {
+                    status,
+                    code,
+                    information,
+                    tag,
+                } => {
+                    self.check_status_ok(status, code.as_ref(), information.as_deref())?;
+                    (tag == id).then_some(matches!(code, Some(imap_proto::ResponseCode::Alert)))
                 }
+                _ => None,
+            };
+            if let Some(alert) = completion {
+                // An ALERT must reach the user even on a successful completion.
+                if alert && let Some(unsolicited) = &unsolicited {
+                    unsolicited
+                        .try_send(UnsolicitedResponse::Other(response))
+                        .ok();
+                }
+                return Ok(());
             }
 
             if let Some(unsolicited) = unsolicited.clone() {
@@ -1501,6 +1529,16 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
                 "status: {status:?}, code: {code:?}, information: {information:?}"
             )))),
         }
+    }
+}
+
+fn capabilities_from_code(code: Option<&imap_proto::ResponseCode<'_>>) -> Option<Capabilities> {
+    if let Some(imap_proto::ResponseCode::Capabilities(capabilities)) = code {
+        let capability_set: HashSet<Capability> =
+            capabilities.iter().map(Capability::from).collect();
+        Some(Capabilities(capability_set))
+    } else {
+        None
     }
 }
 
@@ -1752,6 +1790,77 @@ mod tests {
         } else {
             unreachable!("invalid login");
         }
+    }
+
+    fn alerts<T: Read + Write + Unpin + fmt::Debug>(session: &Session<T>) -> Vec<String> {
+        let mut alerts = Vec::new();
+        while let Ok(message) = session.unsolicited_responses.try_recv() {
+            let UnsolicitedResponse::Other(response) = message else {
+                continue;
+            };
+            if let Response::Data {
+                code: Some(imap_proto::ResponseCode::Alert),
+                information,
+                ..
+            }
+            | Response::Done {
+                code: Some(imap_proto::ResponseCode::Alert),
+                information,
+                ..
+            } = response.parsed()
+            {
+                alerts.push(information.as_deref().unwrap_or_default().to_owned());
+            }
+        }
+        alerts
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn login_reports_alerts() {
+        let response = b"* OK [ALERT] Password expires soon\r\n\
+                         A0001 OK [ALERT] Maintenance tonight\r\n"
+            .to_vec();
+        let client = mock_client!(MockStream::new(response));
+        let session = client.login("username", "password").await.ok().unwrap();
+        assert_eq!(
+            alerts(&session),
+            ["Password expires soon", "Maintenance tonight"]
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn authenticate_reports_alerts() {
+        let response = b"+ \r\n\
+                         * OK [ALERT] Password expires soon\r\n\
+                         A0001 OK [ALERT] Maintenance tonight\r\n"
+            .to_vec();
+        struct Plain;
+        impl Authenticator for Plain {
+            type Response = Vec<u8>;
+            fn process(&mut self, _challenge: &[u8]) -> Self::Response {
+                b"\0username\0password".to_vec()
+            }
+        }
+        let client = mock_client!(MockStream::new(response));
+        let session = client.authenticate("PLAIN", Plain).await.ok().unwrap();
+        assert_eq!(
+            alerts(&session),
+            ["Password expires soon", "Maintenance tonight"]
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn command_reports_tagged_alert() {
+        let response = b"A0001 OK [ALERT] Maintenance tonight\r\n".to_vec();
+        let mut session = mock_session!(MockStream::new(response));
+        session.run_command_and_check_ok("NOOP").await.unwrap();
+        assert_eq!(alerts(&session), ["Maintenance tonight"]);
     }
 
     /// Tests that `login_with_capabilities()` returns None
