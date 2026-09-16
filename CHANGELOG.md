@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Add `runtime-futures` feature: use only `futures-io` traits without Tokio or async-std, so the caller provides the executor, I/O and timers. `Handle::wait()` and `Handle::wait_with_timeout()` need a runtime timer and are not available with this feature.
+- Add `Handle::wait_until()`: wait for IDLE responses until a caller-provided future completes, with any timer.
 
 ## [0.11.3] - 2026-07-17
 

@@ -1566,6 +1566,52 @@ mod tests {
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn idle_wait_until_new_data() {
+        let response = b"+ idling\r\n* 3 EXISTS\r\n".to_vec();
+        let mut idle = mock_session!(MockStream::new(response)).idle();
+        idle.init().await.unwrap();
+        let result = idle.wait_until(std::future::pending::<()>()).await.unwrap();
+        match result {
+            extensions::idle::IdleResponse::NewData(data) => assert_eq!(
+                data.parsed(),
+                &Response::MailboxData(imap_proto::MailboxDatum::Exists(3))
+            ),
+            other => panic!("unexpected idle response {other:?}"),
+        }
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn idle_wait_until_stop_then_done() {
+        let response = b"+ idling\r\nA0001 OK IDLE terminated\r\n".to_vec();
+        let mut idle = mock_session!(MockStream::new(response)).idle();
+        idle.init().await.unwrap();
+        assert_eq!(
+            idle.wait_until(std::future::ready(())).await.unwrap(),
+            extensions::idle::IdleResponse::Timeout
+        );
+        let session = idle.done().await.unwrap();
+        assert_eq_bytes!(
+            &session.stream.inner.written_buf,
+            b"A0001 IDLE\r\nDONE\r\n",
+            "Invalid IDLE commands"
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn idle_wait_until_connection_lost() {
+        let response = b"+ idling\r\n".to_vec();
+        let mut idle = mock_session!(MockStream::new(response).with_eof()).idle();
+        let _ = idle.init().await;
+        assert!(idle.wait_until(std::future::pending::<()>()).await.is_err());
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn readline_delay_read() {
         let greeting = "* OK Dovecot ready.\r\n";
         let mock_stream = MockStream::default()

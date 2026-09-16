@@ -5,14 +5,14 @@ use std::pin::Pin;
 #[cfg(any(feature = "runtime-tokio", feature = "runtime-async-std"))]
 use std::time::Duration;
 
+use async_channel as channel;
 #[cfg(feature = "runtime-async-std")]
 use async_std::future::timeout;
-#[cfg(any(feature = "runtime-tokio", feature = "runtime-async-std"))]
-use futures_util::StreamExt as _;
 #[cfg(not(feature = "runtime-tokio"))]
 use futures_util::io::{AsyncRead as Read, AsyncWrite as Write};
 use futures_util::{
-    Stream, TryStreamExt as _,
+    Stream, StreamExt as _, TryStreamExt as _,
+    future::{self, Either},
     task::{Context, Poll},
 };
 use imap_proto::{RequestId, Response, Status};
@@ -25,9 +25,9 @@ use tokio::{
 };
 
 use crate::client::Session;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::parse::handle_unilateral;
-use crate::types::ResponseData;
+use crate::types::{ResponseData, UnsolicitedResponse};
 
 /// `Handle` allows a client to block waiting for changes to the remote mailbox.
 ///
@@ -171,25 +171,41 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
                     return Ok(IdleResponse::ManualInterrupt);
                 };
 
-                let resp = resp?;
-                match resp.parsed() {
-                    Response::Data {
-                        status: Status::Ok, ..
-                    } => {
-                        // all good continue
-                    }
-                    Response::Continue { .. } => {
-                        // continuation, wait for it
-                    }
-                    Response::Done { .. } => {
-                        handle_unilateral(resp, sender.clone());
-                    }
-                    _ => return Ok(IdleResponse::NewData(resp)),
+                if let Some(response) = idle_response(resp?, &sender) {
+                    return Ok(response);
                 }
             }
         };
 
         (fut, interrupt)
+    }
+
+    /// Start listening to the server side responses until `stop` completes.
+    ///
+    /// Returns [`IdleResponse::Timeout`] once `stop` completes, so the caller
+    /// chooses the timer; this also works with `runtime-futures`. `stop` is
+    /// checked before each read, and responses not read yet stay buffered.
+    /// Clients should still re-issue IDLE at least every 29 minutes.
+    ///
+    /// Must be called after [`Handle::init`].
+    pub async fn wait_until<F: Future<Output = ()>>(&mut self, stop: F) -> Result<IdleResponse> {
+        assert!(
+            self.id.is_some(),
+            "Cannot listen to response without starting IDLE"
+        );
+        let sender = self.session.unsolicited_responses_tx.clone();
+        let mut stop = std::pin::pin!(stop);
+        loop {
+            match future::select(stop.as_mut(), self.next()).await {
+                Either::Left(((), _)) => return Ok(IdleResponse::Timeout),
+                Either::Right((None, _)) => return Err(Error::ConnectionLost),
+                Either::Right((Some(resp), _)) => {
+                    if let Some(response) = idle_response(resp?, &sender) {
+                        return Ok(response);
+                    }
+                }
+            }
+        }
     }
 
     /// Initialise the idle connection by sending the `IDLE` command to the server.
@@ -241,5 +257,24 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
             .await?;
 
         Ok(self.session)
+    }
+}
+
+/// Classifies a response received while idling; `None` keeps waiting.
+fn idle_response(
+    resp: ResponseData,
+    sender: &channel::Sender<UnsolicitedResponse>,
+) -> Option<IdleResponse> {
+    match resp.parsed() {
+        Response::Data {
+            status: Status::Ok, ..
+        } => None,
+        // continuation, wait for it
+        Response::Continue { .. } => None,
+        Response::Done { .. } => {
+            handle_unilateral(resp, sender.clone());
+            None
+        }
+        _ => Some(IdleResponse::NewData(resp)),
     }
 }
