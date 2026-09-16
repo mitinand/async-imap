@@ -25,6 +25,8 @@ compress = ["async-compression"]
 
 runtime-async-std = ["async-std", "async-compression?/futures-io"]
 runtime-tokio = ["tokio", "async-compression?/tokio"]
+# Only `futures-io` traits, no runtime: the caller owns I/O, timers and the executor.
+runtime-futures = ["async-compression?/futures-io"]
 
 [dependencies]
 async-channel = "2.0.0"

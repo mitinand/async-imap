@@ -5,11 +5,11 @@ use std::pin::Pin;
 use std::str;
 
 use async_channel::{self as channel, bounded};
-#[cfg(feature = "runtime-async-std")]
-use async_std::io::{Read, Write, WriteExt};
 use base64::Engine as _;
 use extensions::id::{format_identification, parse_id};
 use extensions::quota::parse_get_quota_root;
+#[cfg(not(feature = "runtime-tokio"))]
+use futures_util::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 use futures_util::{Stream, TryStreamExt, io};
 use imap_proto::{Metadata, RequestId, Response};
 #[cfg(feature = "runtime-tokio")]
@@ -801,7 +801,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///
     /// ```no_run
     /// use async_imap::{types::Seq, Session, error::Result};
-    /// #[cfg(feature = "runtime-async-std")]
+    /// #[cfg(not(feature = "runtime-tokio"))]
     /// use async_std::net::TcpStream;
     /// #[cfg(feature = "runtime-tokio")]
     /// use tokio::net::TcpStream;
@@ -1553,6 +1553,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn fetch_body() {
         let response = "a0 OK Logged in.\r\n\
                         * 2 FETCH (BODY[TEXT] {3}\r\nfoo)\r\n\
@@ -1564,6 +1565,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn readline_delay_read() {
         let greeting = "* OK Dovecot ready.\r\n";
         let mock_stream = MockStream::default()
@@ -1584,6 +1586,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn readline_eof() {
         let mock_stream = MockStream::default().with_eof();
         let mut client = mock_client!(mock_stream);
@@ -1593,6 +1596,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     #[should_panic]
     async fn readline_err() {
         // TODO Check the error test
@@ -1603,6 +1607,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn authenticate() {
         let response = b"+ YmFy\r\n\
                          A0001 OK Logged in\r\n"
@@ -1635,6 +1640,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn login() {
         let response = b"A0001 OK Logged in\r\n".to_vec();
         let username = "username";
@@ -1658,6 +1664,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn login_ignores_completion_for_other_command_tag() {
         let response = b"A9999 NO Other command rejected\r\n\
                          A0001 OK Logged in\r\n"
@@ -1674,6 +1681,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn login_with_capabilities() {
         let response = b"A0001 OK [CAPABILITY IMAP4rev1 IDLE MOVE] Logged in\r\n".to_vec();
         let username = "username";
@@ -1704,6 +1712,7 @@ mod tests {
     /// if no capabilities are in the response to the LOGIN command.
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn login_without_capabilities() {
         let response = b"A0001 OK Logged in\r\n".to_vec();
         let username = "username";
@@ -1727,6 +1736,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn logout() {
         let response = b"A0001 OK Logout completed.\r\n".to_vec();
         let command = "A0001 LOGOUT\r\n";
@@ -1741,6 +1751,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn rename() {
         let response = b"A0001 OK RENAME completed\r\n".to_vec();
         let current_mailbox_name = "INBOX";
@@ -1764,6 +1775,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn subscribe() {
         let response = b"A0001 OK SUBSCRIBE completed\r\n".to_vec();
         let mailbox = "INBOX";
@@ -1779,6 +1791,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn unsubscribe() {
         let response = b"A0001 OK UNSUBSCRIBE completed\r\n".to_vec();
         let mailbox = "INBOX";
@@ -1794,6 +1807,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn expunge() {
         let response = b"A0001 OK EXPUNGE completed\r\n".to_vec();
         let mock_stream = MockStream::new(response);
@@ -1807,6 +1821,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn uid_expunge() {
         let response = b"* 2 EXPUNGE\r\n\
             * 3 EXPUNGE\r\n\
@@ -1829,6 +1844,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn check() {
         let response = b"A0001 OK CHECK completed\r\n".to_vec();
         let mock_stream = MockStream::new(response);
@@ -1842,6 +1858,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn examine() {
         let response = b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
             * OK [PERMANENTFLAGS ()] Read-only mailbox.\r\n\
@@ -1882,6 +1899,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn select() {
         let response = b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
             * OK [PERMANENTFLAGS (\\* \\Answered \\Flagged \\Deleted \\Draft \\Seen)] \
@@ -1931,6 +1949,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn search() {
         let response = b"* SEARCH 1 2 3 4 5\r\n\
             A0001 OK Search completed\r\n"
@@ -1948,6 +1967,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn uid_search() {
         let response = b"* SEARCH 1 2 3 4 5\r\n\
             A0001 OK Search completed\r\n"
@@ -1965,6 +1985,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn uid_search_unordered() {
         let response = b"* SEARCH 1 2 3 4 5\r\n\
             A0002 OK CAPABILITY completed\r\n\
@@ -1983,6 +2004,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn capability() {
         let response = b"* CAPABILITY IMAP4rev1 STARTTLS AUTH=GSSAPI LOGINDISABLED\r\n\
             A0001 OK CAPABILITY completed\r\n"
@@ -2003,6 +2025,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn create() {
         let response = b"A0001 OK CREATE completed\r\n".to_vec();
         let mailbox_name = "INBOX";
@@ -2018,6 +2041,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn delete() {
         let response = b"A0001 OK DELETE completed\r\n".to_vec();
         let mailbox_name = "INBOX";
@@ -2033,6 +2057,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn noop() {
         let response = b"A0001 OK NOOP completed\r\n".to_vec();
         let mock_stream = MockStream::new(response);
@@ -2046,6 +2071,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn close() {
         let response = b"A0001 OK CLOSE completed\r\n".to_vec();
         let mock_stream = MockStream::new(response);
@@ -2059,6 +2085,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn store() {
         generic_store(" ", |c, set, query| async move {
             c.lock()
@@ -2074,6 +2101,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn uid_store() {
         generic_store(" UID ", |c, set, query| async move {
             c.lock()
@@ -2102,6 +2130,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn copy() {
         generic_copy(" ", |c, set, query| async move {
             c.lock().await.copy(set, query).await?;
@@ -2112,6 +2141,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn uid_copy() {
         generic_copy(" UID ", |c, set, query| async move {
             c.lock().await.uid_copy(set, query).await?;
@@ -2142,6 +2172,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn mv() {
         let response = b"* OK [COPYUID 1511554416 142,399 41:42] Moved UIDs.\r\n\
             * 2 EXPUNGE\r\n\
@@ -2161,6 +2192,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn uid_mv() {
         let response = b"* OK [COPYUID 1511554416 142,399 41:42] Moved UIDs.\r\n\
             * 2 EXPUNGE\r\n\
@@ -2180,6 +2212,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn fetch() {
         generic_fetch(" ", |c, seq, query| async move {
             c.lock()
@@ -2196,6 +2229,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn uid_fetch() {
         generic_fetch(" UID ", |c, seq, query| async move {
             c.lock()
@@ -2211,6 +2245,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn fetch_unexpected_eof() {
         // Connection is lost, there will never be any response.
         let response = b"".to_vec();
@@ -2415,6 +2450,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn status() {
         {
             let response = b"* STATUS INBOX (UIDNEXT 25)\r\n\
@@ -2469,6 +2505,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn append() {
         {
             // APPEND command when INBOX is *not* selected.
@@ -2530,6 +2567,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn get_metadata() {
         {
             let response = b"* METADATA \"INBOX\" (/private/comment \"My own comment\")\r\n\
@@ -2649,6 +2687,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn test_get_quota_root() {
         {
             let response = b"* QUOTAROOT Sent Userquota\r\n\
@@ -2721,6 +2760,7 @@ mod tests {
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn test_parsing_error() {
         // Simulate someone connecting to SMTP server with IMAP client.
         let response = b"220 mail.example.org ESMTP Postcow\r\n".to_vec();

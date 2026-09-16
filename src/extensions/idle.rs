@@ -2,18 +2,21 @@
 
 use std::fmt;
 use std::pin::Pin;
+#[cfg(any(feature = "runtime-tokio", feature = "runtime-async-std"))]
 use std::time::Duration;
 
 #[cfg(feature = "runtime-async-std")]
-use async_std::{
-    future::timeout,
-    io::{Read, Write},
-};
+use async_std::future::timeout;
+#[cfg(any(feature = "runtime-tokio", feature = "runtime-async-std"))]
+use futures_util::StreamExt as _;
+#[cfg(not(feature = "runtime-tokio"))]
+use futures_util::io::{AsyncRead as Read, AsyncWrite as Write};
 use futures_util::{
-    Stream, StreamExt as _, TryStreamExt as _,
+    Stream, TryStreamExt as _,
     task::{Context, Poll},
 };
 use imap_proto::{RequestId, Response, Status};
+#[cfg(any(feature = "runtime-tokio", feature = "runtime-async-std"))]
 use stop_token::prelude::*;
 #[cfg(feature = "runtime-tokio")]
 use tokio::{
@@ -69,6 +72,7 @@ impl<St: Unpin> Unpin for IdleStream<'_, St> {}
 impl<'a, St: Stream + Unpin> IdleStream<'a, St> {
     unsafe_pinned!(stream: &'a mut St);
 
+    #[cfg(any(feature = "runtime-tokio", feature = "runtime-async-std"))]
     pub(crate) fn new(stream: &'a mut St) -> Self {
         IdleStream { stream }
     }
@@ -118,6 +122,9 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
 
     /// Start listening to the server side responses.
     /// Must be called after [`Handle::init`].
+    ///
+    /// Not available with `runtime-futures`, which has no timer.
+    #[cfg(any(feature = "runtime-tokio", feature = "runtime-async-std"))]
     pub fn wait(
         &mut self,
     ) -> (
@@ -133,6 +140,9 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
     /// Timeout is reset by any response, including `* OK Still here` keepalives.
     ///
     /// Must be called after [Handle::init].
+    ///
+    /// Not available with `runtime-futures`, which has no timer.
+    #[cfg(any(feature = "runtime-tokio", feature = "runtime-async-std"))]
     pub fn wait_with_timeout(
         &mut self,
         dur: Duration,

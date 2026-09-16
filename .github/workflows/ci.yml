@@ -37,6 +37,12 @@ jobs:
     - name: check compress feature with async-std
       run: cargo check --workspace --all-targets --no-default-features --features runtime-async-std,compress
 
+    - name: check runtime-futures
+      run: cargo check --workspace --all-targets --no-default-features --features runtime-futures
+
+    - name: check compress feature with runtime-futures
+      run: cargo check --workspace --all-targets --no-default-features --features runtime-futures,compress
+
     - name: check async-std examples
       working-directory: examples
       run: cargo check --workspace --all-targets --no-default-features --features runtime-async-std
@@ -47,6 +53,9 @@ jobs:
 
     - name: tests
       run: cargo test --workspace
+
+    - name: tests with runtime-futures
+      run: cargo test --workspace --no-default-features --features runtime-futures
 
   check_fmt_and_docs:
     name: Checking fmt and docs

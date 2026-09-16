@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+- Add `runtime-futures` feature: use only `futures-io` traits without Tokio or async-std, so the caller provides the executor, I/O and timers. `Handle::wait()` and `Handle::wait_with_timeout()` need a runtime timer and are not available with this feature.
+
 ## [0.11.3] - 2026-07-17
 
 - Add `login_with_capabilities()` to `LOGIN` and get capabilities from the response at the same time.

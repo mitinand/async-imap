@@ -12,10 +12,12 @@ use crate::error::Result;
 use crate::imap_stream::ImapStream;
 use crate::types::IdGenerator;
 
-#[cfg(feature = "runtime-async-std")]
-use async_std::io::{IoSlice, IoSliceMut, Read, Write};
-#[cfg(feature = "runtime-async-std")]
+#[cfg(not(feature = "runtime-tokio"))]
 use futures_util::io::BufReader;
+#[cfg(not(feature = "runtime-tokio"))]
+use futures_util::io::{AsyncRead as Read, AsyncWrite as Write};
+#[cfg(not(feature = "runtime-tokio"))]
+use std::io::{IoSlice, IoSliceMut};
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, BufReader, ReadBuf};
 
@@ -24,9 +26,9 @@ use async_compression::tokio::bufread::DeflateDecoder;
 #[cfg(feature = "runtime-tokio")]
 use async_compression::tokio::write::DeflateEncoder;
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(not(feature = "runtime-tokio"))]
 use async_compression::futures::bufread::DeflateDecoder;
-#[cfg(feature = "runtime-async-std")]
+#[cfg(not(feature = "runtime-tokio"))]
 use async_compression::futures::write::DeflateEncoder;
 
 /// Network stream compressed with DEFLATE.
@@ -72,13 +74,13 @@ impl<T: Read + Write + Unpin + fmt::Debug> Read for DeflateStream<T> {
     }
 }
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(not(feature = "runtime-tokio"))]
 impl<T: Read + Write + Unpin + fmt::Debug> Read for DeflateStream<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
-    ) -> Poll<async_std::io::Result<usize>> {
+    ) -> Poll<std::io::Result<usize>> {
         self.project().inner.poll_read(cx, buf)
     }
 
@@ -86,7 +88,7 @@ impl<T: Read + Write + Unpin + fmt::Debug> Read for DeflateStream<T> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &mut [IoSliceMut<'_>],
-    ) -> Poll<async_std::io::Result<usize>> {
+    ) -> Poll<std::io::Result<usize>> {
         self.project().inner.poll_read_vectored(cx, bufs)
     }
 }
@@ -128,27 +130,27 @@ impl<T: Read + Write + Unpin + fmt::Debug> Write for DeflateStream<T> {
     }
 }
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(not(feature = "runtime-tokio"))]
 impl<T: Read + Write + Unpin + fmt::Debug> Write for DeflateStream<T> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
-    ) -> Poll<async_std::io::Result<usize>> {
+    ) -> Poll<std::io::Result<usize>> {
         self.project().inner.as_mut().poll_write(cx, buf)
     }
 
     fn poll_flush(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<async_std::io::Result<()>> {
+    ) -> Poll<std::io::Result<()>> {
         self.project().inner.poll_flush(cx)
     }
 
     fn poll_close(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<async_std::io::Result<()>> {
+    ) -> Poll<std::io::Result<()>> {
         self.project().inner.poll_close(cx)
     }
 
@@ -156,7 +158,7 @@ impl<T: Read + Write + Unpin + fmt::Debug> Write for DeflateStream<T> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
-    ) -> Poll<async_std::io::Result<usize>> {
+    ) -> Poll<std::io::Result<usize>> {
         self.project().inner.poll_write_vectored(cx, bufs)
     }
 }
