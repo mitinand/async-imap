@@ -188,12 +188,31 @@ pub(crate) async fn parse_capabilities<T: Stream<Item = io::Result<ResponseData>
 ) -> Result<Capabilities> {
     let mut caps: HashSet<Capability> = HashSet::new();
 
-    while let Some(resp) = stream
-        .take_while(|res| filter(res, &command_tag))
-        .try_next()
-        .await?
-    {
+    while let Some(resp) = stream.try_next().await? {
         match resp.parsed() {
+            Response::Done {
+                tag,
+                status,
+                code,
+                information,
+                ..
+            } if tag == &command_tag => {
+                use imap_proto::Status;
+                match status {
+                    Status::Ok => return Ok(Capabilities(caps)),
+                    Status::Bad => {
+                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")));
+                    }
+                    Status::No => {
+                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")));
+                    }
+                    _ => {
+                        return Err(Error::Io(io::Error::other(format!(
+                            "status: {status:?}, code: {code:?}, information: {information:?}"
+                        ))));
+                    }
+                }
+            }
             Response::Capabilities(cs) => {
                 for c in cs {
                     caps.insert(Capability::from(c)); // TODO: avoid clone

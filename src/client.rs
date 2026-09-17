@@ -1907,6 +1907,15 @@ mod tests {
         assert_eq!(alerts(&session), ["Maintenance tonight"]);
     }
 
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn capabilities_rejected() {
+        let response = b"A0001 BAD Unknown command\r\n".to_vec();
+        let mut client = mock_client!(MockStream::new(response));
+        assert!(matches!(client.capabilities().await, Err(Error::Bad(_))));
+    }
+
     /// Tests that `login_with_capabilities()` returns None
     /// if no capabilities are in the response to the LOGIN command.
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
