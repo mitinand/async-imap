@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `runtime-futures` feature: use only `futures-io` traits without Tokio or async-std, so the caller provides the executor, I/O and timers. `Handle::wait()` and `Handle::wait_with_timeout()` need a runtime timer and are not available with this feature.
 - Report ALERTs received while signing in: `login()`, `login_with_capabilities()` and `authenticate()` forward unilateral responses to `Session::unsolicited_responses`. A tagged completion with an `ALERT` response code is also forwarded there, for sign-in and for other commands.
 - Add `Client::capabilities()` to ask for capabilities before signing in, for example to check `STARTTLS` or `AUTH=PLAIN`. Unilateral responses received before signing in are delivered through `Session::unsolicited_responses`.
+- Trace logging of sent commands shows only the command name and size; arguments and continuation data such as passwords and tokens are no longer logged.
 - Add `Handle::wait_until()`: wait for IDLE responses until a caller-provided future completes, with any timer.
 
 ## [0.11.3] - 2026-07-17

@@ -1,5 +1,6 @@
 use std::fmt;
 use std::pin::Pin;
+use std::str;
 
 use bytes::BytesMut;
 #[cfg(not(feature = "runtime-tokio"))]
@@ -48,10 +49,12 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
     }
 
     pub async fn encode(&mut self, msg: Request) -> Result<(), io::Error> {
+        // Arguments and continuation data can contain passwords or tokens.
         log::trace!(
-            "encode: input: {:?}, {:?}",
+            "encode: input: {:?}, {} ({} bytes)",
             msg.0,
-            std::str::from_utf8(&msg.1)
+            loggable_command(&msg),
+            msg.1.len()
         );
 
         if let Some(tag) = msg.0 {
@@ -344,6 +347,17 @@ impl<R: Read + Write + Unpin> Stream for ImapStream<R> {
     }
 }
 
+/// The command name of a tagged request, without its arguments.
+/// Untagged data other than `DONE` answers a continuation and is hidden.
+fn loggable_command(msg: &Request) -> &str {
+    let name = msg.1.split(|byte| *byte == b' ').next().unwrap_or_default();
+    match (&msg.0, str::from_utf8(name)) {
+        (Some(_), Ok(name)) => name,
+        (None, _) if msg.1 == b"DONE" => "DONE",
+        _ => "[redacted]",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +483,19 @@ mod tests {
 
         // IMAP stream should end even though underlying stream fails only once.
         assert!(imap_stream.next().await.is_none());
+    }
+
+    #[test]
+    fn trace_hides_credentials() {
+        let login = Request(
+            Some(imap_proto::RequestId("A0001".into())),
+            b"LOGIN \"user\" \"secret\"".to_vec(),
+        );
+        assert_eq!(loggable_command(&login), "LOGIN");
+        let authenticate_data = Request(None, b"AHVzZXIAc2VjcmV0".to_vec());
+        assert_eq!(loggable_command(&authenticate_data), "[redacted]");
+        let done = Request(None, b"DONE".to_vec());
+        assert_eq!(loggable_command(&done), "DONE");
     }
 
     #[test]
