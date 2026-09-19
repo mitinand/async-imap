@@ -329,28 +329,24 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
                 ..
             } if tag == &command_tag => {
                 use imap_proto::Status;
-                match status {
-                    Status::Ok => {
-                        break;
-                    }
-                    Status::Bad => {
-                        return Err(Error::Bad(StatusResponse::new(
-                            code.as_ref(),
-                            information.as_deref(),
-                        )));
-                    }
-                    Status::No => {
-                        return Err(Error::No(StatusResponse::new(
-                            code.as_ref(),
-                            information.as_deref(),
-                        )));
-                    }
-                    _ => {
-                        return Err(Error::Io(io::Error::other(format!(
-                            "status: {status:?}, code: {code:?}, information: {information:?}"
-                        ))));
-                    }
+                let result = match status {
+                    Status::Ok => Ok(mailbox),
+                    Status::Bad => Err(Error::Bad(StatusResponse::new(
+                        code.as_ref(),
+                        information.as_deref(),
+                    ))),
+                    Status::No => Err(Error::No(StatusResponse::new(
+                        code.as_ref(),
+                        information.as_deref(),
+                    ))),
+                    _ => Err(Error::Io(io::Error::other(format!(
+                        "status: {status:?}, code: {code:?}, information: {information:?}"
+                    )))),
+                };
+                if matches!(code, Some(imap_proto::ResponseCode::Alert)) {
+                    handle_unilateral(resp, unsolicited.clone());
                 }
+                return result;
             }
             Response::Data {
                 status,
@@ -359,7 +355,7 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
             } => {
                 use imap_proto::Status;
 
-                match status {
+                let result = match status {
                     Status::Ok => {
                         use imap_proto::ResponseCode;
                         match code {
@@ -382,25 +378,24 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
                             }
                             _ => {}
                         }
+                        Ok(())
                     }
-                    Status::Bad => {
-                        return Err(Error::Bad(StatusResponse::new(
-                            code.as_ref(),
-                            information.as_deref(),
-                        )));
-                    }
-                    Status::No => {
-                        return Err(Error::No(StatusResponse::new(
-                            code.as_ref(),
-                            information.as_deref(),
-                        )));
-                    }
-                    _ => {
-                        return Err(Error::Io(io::Error::other(format!(
-                            "status: {status:?}, code: {code:?}, information: {information:?}"
-                        ))));
-                    }
+                    Status::Bad => Err(Error::Bad(StatusResponse::new(
+                        code.as_ref(),
+                        information.as_deref(),
+                    ))),
+                    Status::No => Err(Error::No(StatusResponse::new(
+                        code.as_ref(),
+                        information.as_deref(),
+                    ))),
+                    _ => Err(Error::Io(io::Error::other(format!(
+                        "status: {status:?}, code: {code:?}, information: {information:?}"
+                    )))),
+                };
+                if matches!(code, Some(imap_proto::ResponseCode::Alert)) {
+                    handle_unilateral(resp, unsolicited.clone());
                 }
+                result?;
             }
             Response::MailboxData(m) => match m {
                 MailboxDatum::Status { .. } => handle_unilateral(resp, unsolicited.clone()),
@@ -428,7 +423,7 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
         }
     }
 
-    Ok(mailbox)
+    Err(Error::ConnectionLost)
 }
 
 pub(crate) async fn parse_ids<T: Stream<Item = io::Result<ResponseData>> + Unpin>(
@@ -974,6 +969,76 @@ mod tests {
         assert!(recv.is_empty());
         let ids: HashSet<u32> = ids.iter().cloned().collect();
         assert_eq!(ids, HashSet::<u32>::new());
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn parse_mailbox_requires_a_successful_completion() {
+        for reply in ["* FLAGS (\\Seen)\r\n", "* 0 EXISTS\r\n", "* 1 EXISTS\r\n"] {
+            let (send, _recv) = bounded(10);
+            let mut stream = async_std::stream::from_iter(input_stream(&[reply]));
+            let result = parse_mailbox(&mut stream, send, RequestId("a".into())).await;
+            assert!(matches!(result, Err(Error::ConnectionLost)));
+        }
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn parse_mailbox_confirms_an_empty_mailbox_after_completion() {
+        let (send, recv) = bounded(10);
+        let mut stream = async_std::stream::from_iter(input_stream(&[
+            "* 0 EXISTS\r\n",
+            "a OK [READ-ONLY] EXAMINE completed\r\n",
+        ]));
+        let mailbox = parse_mailbox(&mut stream, send, RequestId("a".into()))
+            .await
+            .unwrap();
+        assert_eq!(mailbox.exists, 0);
+        assert!(recv.is_empty());
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn parse_mailbox_preserves_alerts_and_the_completion_status() {
+        for status in ["OK", "NO", "BAD"] {
+            let (send, recv) = bounded(10);
+            let completion = format!("a {status} [ALERT] Backup in progress\r\n");
+            let mut stream = async_std::stream::from_iter(input_stream(&[
+                "* 1 EXISTS\r\n",
+                "* OK [ALERT] Maintenance tonight\r\n",
+                &completion,
+            ]));
+            let result = parse_mailbox(&mut stream, send, RequestId("a".into())).await;
+            match (status, result) {
+                ("OK", Ok(mailbox)) => assert_eq!(mailbox.exists, 1),
+                ("NO", Err(Error::No(reply))) | ("BAD", Err(Error::Bad(reply))) => {
+                    assert_eq!(reply.code.as_deref(), Some("ALERT"));
+                    assert_eq!(reply.text, "Backup in progress");
+                }
+                _ => panic!("completion status must be preserved"),
+            }
+            for expected_text in ["Maintenance tonight", "Backup in progress"] {
+                let UnsolicitedResponse::Other(alert) = recv.try_recv().unwrap() else {
+                    panic!("the mailbox ALERT must be forwarded");
+                };
+                assert!(matches!(
+                    alert.parsed(),
+                    Response::Data {
+                        code: Some(imap_proto::ResponseCode::Alert),
+                        information: Some(text),
+                        ..
+                    } | Response::Done {
+                        code: Some(imap_proto::ResponseCode::Alert),
+                        information: Some(text),
+                        ..
+                    } if text == expected_text
+                ));
+            }
+            assert!(recv.is_empty(), "forward each ALERT only once");
+        }
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
