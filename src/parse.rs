@@ -1,9 +1,11 @@
 use std::collections::HashSet;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use async_channel as channel;
 use futures_util::stream::Stream;
-use futures_util::{StreamExt as _, TryStreamExt as _, io};
-use imap_proto::{self, MailboxDatum, Metadata, RequestId, Response};
+use futures_util::{StreamExt as _, TryStreamExt as _, io, ready};
+use imap_proto::{self, MailboxDatum, Metadata, RequestId, Response, Status};
 
 use crate::error::{Error, Result, StatusResponse};
 use crate::types::ResponseData;
@@ -66,28 +68,70 @@ pub(crate) fn parse_fetches<T: Stream<Item = io::Result<ResponseData>> + Unpin +
     unsolicited: channel::Sender<UnsolicitedResponse>,
     command_tag: RequestId,
 ) -> impl Stream<Item = Result<Fetch>> + '_ + Send + Unpin {
-    use futures_util::{FutureExt, StreamExt};
+    FetchResponses {
+        stream,
+        unsolicited,
+        command_tag,
+        completed: false,
+    }
+}
 
-    StreamExt::filter_map(
-        StreamExt::take_while(stream, move |res| filter(res, &command_tag)),
-        move |resp| {
-            let unsolicited = unsolicited.clone();
+/// FETCH responses until the command's completion. A NO or BAD completion,
+/// which a server can send after answering for some of the messages, ends
+/// the stream with an error after the responses received before it.
+struct FetchResponses<'a, T> {
+    stream: &'a mut T,
+    unsolicited: channel::Sender<UnsolicitedResponse>,
+    command_tag: RequestId,
+    completed: bool,
+}
 
-            async move {
-                match resp {
-                    Ok(resp) => match resp.parsed() {
-                        Response::Fetch(..) => Some(Ok(Fetch::new(resp))),
-                        _ => {
-                            handle_unilateral(resp, unsolicited);
-                            None
-                        }
-                    },
-                    Err(err) => Some(Err(err.into())),
+impl<T: Stream<Item = io::Result<ResponseData>> + Unpin> Stream for FetchResponses<'_, T> {
+    type Item = Result<Fetch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        while !this.completed {
+            let Some(response) = ready!(this.stream.poll_next_unpin(cx)) else {
+                return Poll::Ready(None);
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => return Poll::Ready(Some(Err(error.into()))),
+            };
+            // `Some` for this command's completion, holding its error, if any.
+            let completion = match response.parsed() {
+                Response::Fetch(..) => return Poll::Ready(Some(Ok(Fetch::new(response)))),
+                Response::Done {
+                    tag,
+                    status,
+                    code,
+                    information,
+                } if tag == &this.command_tag => Some(match status {
+                    Status::No => Some(Error::No(StatusResponse::new(
+                        code.as_ref(),
+                        information.as_deref(),
+                    ))),
+                    Status::Bad => Some(Error::Bad(StatusResponse::new(
+                        code.as_ref(),
+                        information.as_deref(),
+                    ))),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            match completion {
+                Some(error) => {
+                    this.completed = true;
+                    if let Some(error) = error {
+                        return Poll::Ready(Some(Err(error)));
+                    }
                 }
+                None => handle_unilateral(response, this.unsolicited.clone()),
             }
-            .boxed()
-        },
-    )
+        }
+        Poll::Ready(None)
+    }
 }
 
 pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Unpin + Send>(
@@ -614,6 +658,48 @@ mod tests {
         assert_eq!(fetches[1].uid, None);
         assert_eq!(fetches[1].body(), None);
         assert_eq!(fetches[1].header(), None);
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn parse_fetches_reports_a_no_completion_after_the_responses() {
+        let (send, _recv) = bounded(10);
+        let responses = input_stream(&[
+            "* 24 FETCH (UID 4827943)\r\n",
+            "a NO [UNAVAILABLE] Some messages could not be FETCHed\r\n",
+            "* 25 FETCH (UID 4827944)\r\n",
+        ]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let id = RequestId("a".into());
+
+        let mut fetches = parse_fetches(&mut stream, send, id);
+        assert_eq!(
+            fetches.try_next().await.unwrap().unwrap().uid,
+            Some(4827943)
+        );
+        let Err(Error::No(status)) = fetches.try_next().await else {
+            panic!("the NO completion must be reported");
+        };
+        assert_eq!(status.code.as_deref(), Some("UNAVAILABLE"));
+        assert_eq!(status.text, "Some messages could not be FETCHed");
+        // The stream ends at the completion.
+        assert!(fetches.try_next().await.unwrap().is_none());
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn parse_fetches_reports_a_bad_completion() {
+        let (send, _recv) = bounded(10);
+        let responses = input_stream(&["a BAD Invalid sequence set\r\n"]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let id = RequestId("a".into());
+
+        let fetches = parse_fetches(&mut stream, send, id)
+            .try_collect::<Vec<_>>()
+            .await;
+        assert!(matches!(fetches, Err(Error::Bad(_))));
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]

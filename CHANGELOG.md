@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `runtime-futures` feature: use only `futures-io` traits without Tokio or async-std, so the caller provides the executor, I/O and timers. `Handle::wait()` and `Handle::wait_with_timeout()` need a runtime timer and are not available with this feature.
 - Report ALERTs received while signing in: `login()`, `login_with_capabilities()` and `authenticate()` forward unilateral responses to `Session::unsolicited_responses`. A tagged completion with an `ALERT` response code is also forwarded there, for sign-in and for other commands.
+- `fetch()`, `uid_fetch()`, `store()` and `uid_store()` report a NO or BAD completion as an error after the responses received before it; previously the stream ended as if the command had succeeded.
 - `Error::No` and `Error::Bad` hold a `StatusResponse` with the response code and text instead of a debug-formatted string. Codes imap-proto does not parse, such as `AUTHENTICATIONFAILED` and `UNAVAILABLE` from RFC 5530, are taken from the start of the text.
 - Report ALERTs of a rejected sign-in or command: a tagged `NO` or `BAD` completion with an `ALERT` response code is forwarded like a successful one. Add `Client::unsolicited_responses()` to read the ALERTs after `login()` or `authenticate()` returns an error.
 - Add `Client::capabilities()` to ask for capabilities before signing in, for example to check `STARTTLS` or `AUTH=PLAIN`. Unilateral responses received before signing in are delivered through `Session::unsolicited_responses`.
