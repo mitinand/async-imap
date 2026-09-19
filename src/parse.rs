@@ -77,8 +77,9 @@ pub(crate) fn parse_fetches<T: Stream<Item = io::Result<ResponseData>> + Unpin +
 }
 
 /// FETCH responses until the command's completion. A NO or BAD completion,
-/// which a server can send after answering for some of the messages, ends
-/// the stream with an error after the responses received before it.
+/// which a server can send after answering for some of the messages, or a
+/// connection closed before the completion ends the stream with an error
+/// after the responses received before it.
 struct FetchResponses<'a, T> {
     stream: &'a mut T,
     unsolicited: channel::Sender<UnsolicitedResponse>,
@@ -93,7 +94,10 @@ impl<T: Stream<Item = io::Result<ResponseData>> + Unpin> Stream for FetchRespons
         let this = &mut *self;
         while !this.completed {
             let Some(response) = ready!(this.stream.poll_next_unpin(cx)) else {
-                return Poll::Ready(None);
+                // The connection closed before the command completed, for
+                // example after a BYE from a server that shuts down.
+                this.completed = true;
+                return Poll::Ready(Some(Err(Error::ConnectionLost)));
             };
             let response = match response {
                 Ok(response) => response,
@@ -617,7 +621,7 @@ mod tests {
     #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn parse_fetches_empty() {
         let (send, recv) = bounded(10);
-        let responses = input_stream(&[]);
+        let responses = input_stream(&["a OK FETCH completed\r\n"]);
         let mut stream = async_std::stream::from_iter(responses);
         let id = RequestId("a".into());
 
@@ -637,6 +641,7 @@ mod tests {
         let responses = input_stream(&[
             "* 24 FETCH (FLAGS (\\Seen) UID 4827943)\r\n",
             "* 25 FETCH (FLAGS (\\Seen))\r\n",
+            "a OK FETCH completed\r\n",
         ]);
         let mut stream = async_std::stream::from_iter(responses);
         let id = RequestId("a".into());
@@ -690,6 +695,31 @@ mod tests {
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
     #[cfg_attr(feature = "runtime-async-std", async_std::test)]
     #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn parse_fetches_reports_a_connection_closed_before_the_completion() {
+        let (send, recv) = bounded(10);
+        let responses = input_stream(&[
+            "* 24 FETCH (UID 4827943)\r\n",
+            "* BYE Server is restarting\r\n",
+        ]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let id = RequestId("a".into());
+
+        let mut fetches = parse_fetches(&mut stream, send, id);
+        assert_eq!(
+            fetches.try_next().await.unwrap().unwrap().uid,
+            Some(4827943)
+        );
+        assert!(matches!(
+            fetches.try_next().await,
+            Err(Error::ConnectionLost)
+        ));
+        assert!(fetches.try_next().await.unwrap().is_none());
+        assert!(matches!(recv.try_recv(), Ok(UnsolicitedResponse::Other(_))));
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn parse_fetches_reports_a_bad_completion() {
         let (send, _recv) = bounded(10);
         let responses = input_stream(&["a BAD Invalid sequence set\r\n"]);
@@ -708,7 +738,11 @@ mod tests {
     async fn parse_fetches_w_unilateral() {
         // https://github.com/mattnenterprise/rust-imap/issues/81
         let (send, recv) = bounded(10);
-        let responses = input_stream(&["* 37 FETCH (UID 74)\r\n", "* 1 RECENT\r\n"]);
+        let responses = input_stream(&[
+            "* 37 FETCH (UID 74)\r\n",
+            "* 1 RECENT\r\n",
+            "a OK FETCH completed\r\n",
+        ]);
         let mut stream = async_std::stream::from_iter(responses);
         let id = RequestId("a".into());
 
