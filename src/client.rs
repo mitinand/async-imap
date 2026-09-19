@@ -163,6 +163,15 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
         parse_capabilities(&mut self.conn.stream, self.unsolicited.tx.clone(), id).await
     }
 
+    /// Unilateral responses received before signing in.
+    ///
+    /// After a rejected sign-in, this holds ALERTs the server sent with the rejection,
+    /// such as a request to use an application-specific password. After a successful
+    /// sign-in the responses are delivered through [`Session::unsolicited_responses`].
+    pub fn unsolicited_responses(&self) -> &channel::Receiver<UnsolicitedResponse> {
+        &self.unsolicited.rx
+    }
+
     fn into_session(self) -> Session<T> {
         let Self { conn, unsolicited } = self;
         let UnsolicitedChannel { tx, rx } = *unsolicited;
@@ -253,12 +262,13 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
                 handle_unilateral(res, unsolicited_tx.clone());
                 continue;
             };
-            ok_or_unauth_client_err!(status, self);
+            // An ALERT must reach the user whether the sign-in succeeded or not.
             if alert {
                 unsolicited_tx
                     .try_send(UnsolicitedResponse::Other(res))
                     .ok();
             }
+            ok_or_unauth_client_err!(status, self);
             return Ok((self.into_session(), capabilities));
         }
     }
@@ -1509,19 +1519,28 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
                     information,
                     tag,
                 } => {
-                    self.check_status_ok(status, code.as_ref(), information.as_deref())?;
-                    (tag == id).then_some(matches!(code, Some(imap_proto::ResponseCode::Alert)))
+                    let status =
+                        self.check_status_ok(status, code.as_ref(), information.as_deref());
+                    if tag == id {
+                        Some((
+                            status,
+                            matches!(code, Some(imap_proto::ResponseCode::Alert)),
+                        ))
+                    } else {
+                        status?;
+                        None
+                    }
                 }
                 _ => None,
             };
-            if let Some(alert) = completion {
-                // An ALERT must reach the user even on a successful completion.
+            if let Some((status, alert)) = completion {
+                // An ALERT must reach the user whether the command succeeded or not.
                 if alert && let Some(unsolicited) = &unsolicited {
                     unsolicited
                         .try_send(UnsolicitedResponse::Other(response))
                         .ok();
                 }
-                return Ok(());
+                return status;
             }
 
             if let Some(unsolicited) = unsolicited.clone() {
@@ -1813,9 +1832,9 @@ mod tests {
         }
     }
 
-    fn alerts<T: Read + Write + Unpin + fmt::Debug>(session: &Session<T>) -> Vec<String> {
+    fn alerts(responses: &channel::Receiver<UnsolicitedResponse>) -> Vec<String> {
         let mut alerts = Vec::new();
-        while let Ok(message) = session.unsolicited_responses.try_recv() {
+        while let Ok(message) = responses.try_recv() {
             let UnsolicitedResponse::Other(response) = message else {
                 continue;
             };
@@ -1846,7 +1865,7 @@ mod tests {
         let client = mock_client!(MockStream::new(response));
         let session = client.login("username", "password").await.ok().unwrap();
         assert_eq!(
-            alerts(&session),
+            alerts(&session.unsolicited_responses),
             ["Password expires soon", "Maintenance tonight"]
         );
     }
@@ -1869,8 +1888,72 @@ mod tests {
         let client = mock_client!(MockStream::new(response));
         let session = client.authenticate("PLAIN", Plain).await.ok().unwrap();
         assert_eq!(
-            alerts(&session),
+            alerts(&session.unsolicited_responses),
             ["Password expires soon", "Maintenance tonight"]
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn rejected_login_reports_alerts() {
+        let response = b"* OK [ALERT] Too many failures\r\n\
+                         A0001 NO [ALERT] Application-specific password required\r\n"
+            .to_vec();
+        let client = mock_client!(MockStream::new(response));
+        let Err((Error::No(_), client)) = client.login("username", "password").await else {
+            panic!("login must be rejected");
+        };
+        assert_eq!(
+            alerts(client.unsolicited_responses()),
+            [
+                "Too many failures",
+                "Application-specific password required"
+            ]
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn rejected_authenticate_reports_alerts() {
+        let response = b"+ \r\n\
+                         * OK [ALERT] Too many failures\r\n\
+                         A0001 NO [ALERT] Application-specific password required\r\n"
+            .to_vec();
+        struct Plain;
+        impl Authenticator for Plain {
+            type Response = Vec<u8>;
+            fn process(&mut self, _challenge: &[u8]) -> Self::Response {
+                b"\0username\0password".to_vec()
+            }
+        }
+        let client = mock_client!(MockStream::new(response));
+        let Err((Error::No(_), client)) = client.authenticate("PLAIN", Plain).await else {
+            panic!("authentication must be rejected");
+        };
+        assert_eq!(
+            alerts(client.unsolicited_responses()),
+            [
+                "Too many failures",
+                "Application-specific password required"
+            ]
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn rejected_command_reports_tagged_alert() {
+        let response = b"A0001 NO [ALERT] Mailbox is locked\r\n".to_vec();
+        let mut session = mock_session!(MockStream::new(response));
+        assert!(matches!(
+            session.run_command_and_check_ok("NOOP").await,
+            Err(Error::No(_))
+        ));
+        assert_eq!(
+            alerts(&session.unsolicited_responses),
+            ["Mailbox is locked"]
         );
     }
 
@@ -1881,7 +1964,10 @@ mod tests {
         let response = b"A0001 OK [ALERT] Maintenance tonight\r\n".to_vec();
         let mut session = mock_session!(MockStream::new(response));
         session.run_command_and_check_ok("NOOP").await.unwrap();
-        assert_eq!(alerts(&session), ["Maintenance tonight"]);
+        assert_eq!(
+            alerts(&session.unsolicited_responses),
+            ["Maintenance tonight"]
+        );
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -1904,7 +1990,10 @@ mod tests {
             b"A0001 CAPABILITY\r\nA0002 LOGIN \"username\" \"password\"\r\n",
             "Invalid commands"
         );
-        assert_eq!(alerts(&session), ["Maintenance tonight"]);
+        assert_eq!(
+            alerts(&session.unsolicited_responses),
+            ["Maintenance tonight"]
+        );
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
