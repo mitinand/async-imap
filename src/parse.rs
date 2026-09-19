@@ -5,7 +5,7 @@ use futures_util::stream::Stream;
 use futures_util::{StreamExt as _, TryStreamExt as _, io};
 use imap_proto::{self, MailboxDatum, Metadata, RequestId, Response};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, StatusResponse};
 use crate::types::ResponseData;
 use crate::types::*;
 
@@ -113,10 +113,16 @@ pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Un
                         break;
                     }
                     Status::Bad => {
-                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::Bad(StatusResponse::new(
+                            code.as_ref(),
+                            information.as_deref(),
+                        )));
                     }
                     Status::No => {
-                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::No(StatusResponse::new(
+                            code.as_ref(),
+                            information.as_deref(),
+                        )));
                     }
                     _ => {
                         return Err(Error::Io(io::Error::other(format!(
@@ -201,10 +207,16 @@ pub(crate) async fn parse_capabilities<T: Stream<Item = io::Result<ResponseData>
                 match status {
                     Status::Ok => return Ok(Capabilities(caps)),
                     Status::Bad => {
-                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::Bad(StatusResponse::new(
+                            code.as_ref(),
+                            information.as_deref(),
+                        )));
                     }
                     Status::No => {
-                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::No(StatusResponse::new(
+                            code.as_ref(),
+                            information.as_deref(),
+                        )));
                     }
                     _ => {
                         return Err(Error::Io(io::Error::other(format!(
@@ -265,10 +277,16 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
                         break;
                     }
                     Status::Bad => {
-                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::Bad(StatusResponse::new(
+                            code.as_ref(),
+                            information.as_deref(),
+                        )));
                     }
                     Status::No => {
-                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::No(StatusResponse::new(
+                            code.as_ref(),
+                            information.as_deref(),
+                        )));
                     }
                     _ => {
                         return Err(Error::Io(io::Error::other(format!(
@@ -309,10 +327,16 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
                         }
                     }
                     Status::Bad => {
-                        return Err(Error::Bad(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::Bad(StatusResponse::new(
+                            code.as_ref(),
+                            information.as_deref(),
+                        )));
                     }
                     Status::No => {
-                        return Err(Error::No(format!("code: {code:?}, info: {information:?}")));
+                        return Err(Error::No(StatusResponse::new(
+                            code.as_ref(),
+                            information.as_deref(),
+                        )));
                     }
                     _ => {
                         return Err(Error::Io(io::Error::other(format!(

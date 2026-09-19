@@ -16,7 +16,7 @@ use imap_proto::{Metadata, RequestId, Response};
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 
 use super::authenticator::Authenticator;
-use super::error::{Error, ParseError, Result, ValidateError};
+use super::error::{Error, ParseError, Result, StatusResponse, ValidateError};
 use super::parse::*;
 use super::types::*;
 use crate::extensions::{self, quota::parse_get_quota};
@@ -1563,8 +1563,8 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
         use imap_proto::Status;
         match status {
             Status::Ok => Ok(()),
-            Status::Bad => Err(Error::Bad(format!("code: {code:?}, info: {information:?}"))),
-            Status::No => Err(Error::No(format!("code: {code:?}, info: {information:?}"))),
+            Status::Bad => Err(Error::Bad(StatusResponse::new(code, information))),
+            Status::No => Err(Error::No(StatusResponse::new(code, information))),
             _ => Err(Error::Io(io::Error::other(format!(
                 "status: {status:?}, code: {code:?}, information: {information:?}"
             )))),
@@ -1954,6 +1954,54 @@ mod tests {
         assert_eq!(
             alerts(&session.unsolicited_responses),
             ["Mailbox is locked"]
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn rejected_login_keeps_the_rfc5530_code_and_text() {
+        let response = b"A0001 NO [AUTHENTICATIONFAILED] Invalid credentials\r\n".to_vec();
+        let client = mock_client!(MockStream::new(response));
+        let Err((Error::No(status), _)) = client.login("username", "password").await else {
+            panic!("login must be rejected");
+        };
+        assert_eq!(
+            status,
+            StatusResponse {
+                code: Some("AUTHENTICATIONFAILED".to_owned()),
+                text: "Invalid credentials".to_owned(),
+            }
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn rejected_commands_keep_their_code_and_text() {
+        let response = b"A0001 NO [TRYCREATE] No such mailbox\r\n\
+                         A0002 BAD Unknown command\r\n"
+            .to_vec();
+        let mut session = mock_session!(MockStream::new(response));
+        let Err(Error::No(status)) = session.run_command_and_check_ok("NOOP").await else {
+            panic!("the command must be rejected");
+        };
+        assert_eq!(
+            status,
+            StatusResponse {
+                code: Some("TRYCREATE".to_owned()),
+                text: "No such mailbox".to_owned(),
+            }
+        );
+        let Err(Error::Bad(status)) = session.run_command_and_check_ok("NOOP").await else {
+            panic!("the command must be rejected");
+        };
+        assert_eq!(
+            status,
+            StatusResponse {
+                code: None,
+                text: "Unknown command".to_owned(),
+            }
         );
     }
 

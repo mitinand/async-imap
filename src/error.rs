@@ -1,9 +1,11 @@
 //! IMAP error types.
 
+use std::fmt;
 use std::io::Error as IoError;
 use std::str::Utf8Error;
 
 use base64::DecodeError;
+use imap_proto::ResponseCode;
 
 /// A convenience wrapper around `Result` for `imap::Error`.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -17,10 +19,10 @@ pub enum Error {
     Io(#[from] IoError),
     /// A BAD response from the IMAP server.
     #[error("bad response: {0}")]
-    Bad(String),
+    Bad(StatusResponse),
     /// A NO response from the IMAP server.
     #[error("no response: {0}")]
-    No(String),
+    No(StatusResponse),
     /// The connection was terminated unexpectedly.
     #[error("connection lost")]
     ConnectionLost,
@@ -34,6 +36,81 @@ pub enum Error {
     /// Error appending an e-mail.
     #[error("could not append mail to mailbox")]
     Append,
+}
+
+/// The response code and text of a NO or BAD response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusResponse {
+    /// The response code without its arguments, such as `TRYCREATE`, or a code from
+    /// [RFC 5530](https://tools.ietf.org/html/rfc5530) such as `AUTHENTICATIONFAILED`.
+    pub code: Option<String>,
+    /// The human-readable text after the response code.
+    pub text: String,
+}
+
+impl StatusResponse {
+    pub(crate) fn new(code: Option<&ResponseCode<'_>>, information: Option<&str>) -> Self {
+        let information = information.unwrap_or_default();
+        if let Some(code) = code {
+            return Self {
+                code: response_code_name(code).map(str::to_owned),
+                text: information.to_owned(),
+            };
+        }
+        // imap-proto does not parse codes it does not know, such as those of
+        // RFC 5530; they stay in brackets at the start of the text.
+        let unparsed = information
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once(']'))
+            .and_then(|(code, text)| {
+                let name = code.split(' ').next().filter(|name| !name.is_empty())?;
+                Some((name, text.strip_prefix(' ').unwrap_or(text)))
+            });
+        match unparsed {
+            Some((name, text)) => Self {
+                code: Some(name.to_ascii_uppercase()),
+                text: text.to_owned(),
+            },
+            None => Self {
+                code: None,
+                text: information.to_owned(),
+            },
+        }
+    }
+}
+
+impl fmt::Display for StatusResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.code {
+            Some(code) => write!(f, "[{code}] {}", self.text),
+            None => f.write_str(&self.text),
+        }
+    }
+}
+
+fn response_code_name(code: &ResponseCode<'_>) -> Option<&'static str> {
+    Some(match code {
+        ResponseCode::Alert => "ALERT",
+        ResponseCode::BadCharset(_) => "BADCHARSET",
+        ResponseCode::Capabilities(_) => "CAPABILITY",
+        ResponseCode::HighestModSeq(_) => "HIGHESTMODSEQ",
+        ResponseCode::Parse => "PARSE",
+        ResponseCode::PermanentFlags(_) => "PERMANENTFLAGS",
+        ResponseCode::ReadOnly => "READ-ONLY",
+        ResponseCode::ReadWrite => "READ-WRITE",
+        ResponseCode::TryCreate => "TRYCREATE",
+        ResponseCode::UidNext(_) => "UIDNEXT",
+        ResponseCode::UidValidity(_) => "UIDVALIDITY",
+        ResponseCode::Unseen(_) => "UNSEEN",
+        ResponseCode::AppendUid(..) => "APPENDUID",
+        ResponseCode::CopyUid(..) => "COPYUID",
+        ResponseCode::UidNotSticky => "UIDNOTSTICKY",
+        ResponseCode::MetadataLongEntries(_)
+        | ResponseCode::MetadataMaxSize(_)
+        | ResponseCode::MetadataTooMany
+        | ResponseCode::MetadataNoPrivate => "METADATA",
+        _ => return None,
+    })
 }
 
 /// An error occured while trying to parse a server response.
