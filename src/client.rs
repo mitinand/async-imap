@@ -234,11 +234,12 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
         username: U,
         password: P,
     ) -> ::std::result::Result<(Session<T>, Option<Capabilities>), (Error, Client<T>)> {
-        let u = ok_or_unauth_client_err!(validate_str(username.as_ref()), self);
-        let p = ok_or_unauth_client_err!(validate_str(password.as_ref()), self);
-
         let unsolicited_tx = self.unsolicited.tx.clone();
-        let id = ok_or_unauth_client_err!(self.run_command(&format!("LOGIN {u} {p}")).await, self);
+        let id = ok_or_unauth_client_err!(
+            self.send_login(username.as_ref(), password.as_ref(), &unsolicited_tx)
+                .await,
+            self
+        );
         loop {
             let Some(res) = ok_or_unauth_client_err!(self.stream.try_next().await, self) else {
                 return Err((Error::ConnectionLost, self));
@@ -270,6 +271,91 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
             }
             ok_or_unauth_client_err!(status, self);
             return Ok((self.into_session(), capabilities));
+        }
+    }
+
+    /// Sends LOGIN. An argument that a quoted string cannot carry, such as a
+    /// non-ASCII password, is sent as a literal once the server accepts it.
+    async fn send_login(
+        &mut self,
+        username: &str,
+        password: &str,
+        unsolicited: &channel::Sender<UnsolicitedResponse>,
+    ) -> Result<RequestId> {
+        let mut id = None;
+        let mut line = String::from("LOGIN");
+        for argument in [username, password] {
+            line.push(' ');
+            if is_quotable(argument) {
+                line.push_str(&quote!(argument));
+                continue;
+            }
+            line.push_str(&format!("{{{}}}", argument.len()));
+            let tag = self.send_command_line(&mut id, &line).await?;
+            line.clear();
+            self.wait_for_continuation(&tag, unsolicited).await?;
+            self.conn
+                .stream
+                .as_mut()
+                .write_all(argument.as_bytes())
+                .await?;
+        }
+        self.send_command_line(&mut id, &line).await
+    }
+
+    /// Sends the first line of a command with a new tag, and later lines,
+    /// which follow literals, without one.
+    async fn send_command_line(
+        &mut self,
+        id: &mut Option<RequestId>,
+        line: &str,
+    ) -> Result<RequestId> {
+        match id {
+            Some(id) => {
+                self.conn.run_command_untagged(line).await?;
+                Ok(id.clone())
+            }
+            None => Ok(id.insert(self.conn.run_command(line).await?).clone()),
+        }
+    }
+
+    /// Waits for the server to accept a literal. A NO or BAD completion instead
+    /// is returned as the error, and its ALERT is forwarded.
+    async fn wait_for_continuation(
+        &mut self,
+        id: &RequestId,
+        unsolicited: &channel::Sender<UnsolicitedResponse>,
+    ) -> Result<()> {
+        loop {
+            let Some(response) = self.conn.read_response().await? else {
+                return Err(Error::ConnectionLost);
+            };
+            let completion = match response.parsed() {
+                Response::Continue { .. } => return Ok(()),
+                Response::Done {
+                    tag,
+                    status,
+                    code,
+                    information,
+                } if tag == id => Some((
+                    self.check_status_ok(status, code.as_ref(), information.as_deref()),
+                    matches!(code, Some(imap_proto::ResponseCode::Alert)),
+                )),
+                _ => None,
+            };
+            let Some((status, alert)) = completion else {
+                handle_unilateral(response, unsolicited.clone());
+                continue;
+            };
+            if alert {
+                unsolicited
+                    .try_send(UnsolicitedResponse::Other(response))
+                    .ok();
+            }
+            status?;
+            return Err(Error::Parse(ParseError::Unexpected(
+                "command completed before its literal was sent".to_owned(),
+            )));
         }
     }
 
@@ -1582,6 +1668,13 @@ fn capabilities_from_code(code: Option<&imap_proto::ResponseCode<'_>>) -> Option
     }
 }
 
+/// Whether an IMAP quoted string can carry the text: 7-bit characters other
+/// than NUL, CR and LF.
+fn is_quotable(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| (0x01..=0x7f).contains(&byte) && byte != b'\r' && byte != b'\n')
+}
+
 fn validate_str(value: &str) -> Result<String> {
     let quoted = quote!(value);
     if quoted.find('\n').is_some() {
@@ -1954,6 +2047,53 @@ mod tests {
         assert_eq!(
             alerts(&session.unsolicited_responses),
             ["Mailbox is locked"]
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn login_sends_a_non_ascii_password_as_a_literal() {
+        let response = b"+ Ready\r\nA0001 OK Logged in\r\n".to_vec();
+        let client = mock_client!(MockStream::new(response));
+        let session = client.login("user\"name", "пароль").await.ok().unwrap();
+        assert_eq!(
+            session.stream.inner.written_buf,
+            "A0001 LOGIN \"user\\\"name\" {12}\r\nпароль\r\n".as_bytes()
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn login_sends_both_arguments_as_literals() {
+        let response = b"+ Ready\r\n+ Ready\r\nA0001 OK Logged in\r\n".to_vec();
+        let client = mock_client!(MockStream::new(response));
+        let session = client
+            .login("пользователь", "pass\nword")
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(
+            session.stream.inner.written_buf,
+            "A0001 LOGIN {24}\r\nпользователь {9}\r\npass\nword\r\n".as_bytes()
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn login_rejected_before_a_literal_sends_no_password() {
+        let response = b"A0001 NO [PRIVACYREQUIRED] Use TLS\r\n".to_vec();
+        let client = mock_client!(MockStream::new(response));
+        let Err((Error::No(status), client)) = client.login("username", "пароль").await
+        else {
+            panic!("login must be rejected");
+        };
+        assert_eq!(status.code.as_deref(), Some("PRIVACYREQUIRED"));
+        assert_eq!(
+            client.stream.inner.written_buf,
+            b"A0001 LOGIN \"username\" {12}\r\n"
         );
     }
 
