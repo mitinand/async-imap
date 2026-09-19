@@ -38,6 +38,14 @@ pub enum Error {
     Append,
 }
 
+/// An incoming response is larger than the 512 MiB the client buffers.
+///
+/// It arrives as the source of an [`Error::Io`] of kind `Other`, so it can be
+/// told apart from a response that could not be parsed.
+#[derive(thiserror::Error, Debug)]
+#[error("incoming data too large")]
+pub struct ResponseTooLarge;
+
 /// The response code and text of a NO or BAD response.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusResponse {

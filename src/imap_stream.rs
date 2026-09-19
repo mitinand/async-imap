@@ -12,6 +12,7 @@ use nom::Needed;
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 
+use crate::error::ResponseTooLarge;
 use crate::types::{Request, ResponseData};
 
 /// Wraps a stream, and parses incoming data as imap server messages. Writes outgoing data
@@ -272,7 +273,7 @@ impl Buffer {
             n => min_size + (Self::BLOCK_SIZE - n),
         };
         if new_size > Self::MAX_CAPACITY {
-            Err(io::Error::other("incoming data too large"))
+            Err(io::Error::other(ResponseTooLarge))
         } else {
             self.block.resize(new_size, 0);
             Ok(())
@@ -548,8 +549,8 @@ mod tests {
         buf.grow(Buffer::BLOCK_SIZE + 1).unwrap();
         assert_eq!(buf.block.len(), 4 * Buffer::BLOCK_SIZE);
 
-        let ret = buf.grow(Buffer::MAX_CAPACITY);
-        assert!(ret.is_err());
+        let error = buf.grow(Buffer::MAX_CAPACITY).unwrap_err();
+        assert!(error.get_ref().unwrap().is::<ResponseTooLarge>());
     }
 
     #[test]

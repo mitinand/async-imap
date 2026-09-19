@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `runtime-futures` feature: use only `futures-io` traits without Tokio or async-std, so the caller provides the executor, I/O and timers. `Handle::wait()` and `Handle::wait_with_timeout()` need a runtime timer and are not available with this feature.
 - Report ALERTs received while signing in: `login()`, `login_with_capabilities()` and `authenticate()` forward unilateral responses to `Session::unsolicited_responses`. A tagged completion with an `ALERT` response code is also forwarded there, for sign-in and for other commands.
+- A response over the 512 MiB buffer limit is reported with the typed `error::ResponseTooLarge` as the source of the `io::Error`, so it can be told apart from a parse error.
 - `login()` sends the user name or password as a literal when a quoted string cannot carry it, for example a non-ASCII password, instead of sending 8-bit characters in a quoted string or failing on CR or LF.
 - `fetch()`, `uid_fetch()`, `store()` and `uid_store()` report a NO or BAD completion as an error after the responses received before it; previously the stream ended as if the command had succeeded.
 - `Error::No` and `Error::Bad` hold a `StatusResponse` with the response code and text instead of a debug-formatted string. Codes imap-proto does not parse, such as `AUTHENTICATIONFAILED` and `UNAVAILABLE` from RFC 5530, are taken from the start of the text.
