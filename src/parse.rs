@@ -127,6 +127,15 @@ impl<T: Stream<Item = io::Result<ResponseData>> + Unpin> Stream for FetchRespons
             match completion {
                 Some(error) => {
                     this.completed = true;
+                    if matches!(
+                        response.parsed(),
+                        Response::Done {
+                            code: Some(imap_proto::ResponseCode::Alert),
+                            ..
+                        }
+                    ) {
+                        handle_unilateral(response, this.unsolicited.clone());
+                    }
                     if let Some(error) = error {
                         return Poll::Ready(Some(Err(error)));
                     }
@@ -730,6 +739,68 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await;
         assert!(matches!(fetches, Err(Error::Bad(_))));
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn parse_fetches_preserves_alerts_from_each_completion_status() {
+        for status in ["OK", "NO", "BAD"] {
+            let (send, recv) = bounded(10);
+            let completion = format!("a {status} [ALERT] Maintenance tonight\r\n");
+            let responses = input_stream(&["* 24 FETCH (UID 4827943)\r\n", &completion]);
+            let mut stream = async_std::stream::from_iter(responses);
+            let mut fetches = parse_fetches(&mut stream, send, RequestId("a".into()));
+            assert_eq!(
+                fetches.try_next().await.unwrap().unwrap().uid,
+                Some(4827943)
+            );
+            match (status, fetches.try_next().await) {
+                ("OK", Ok(None)) => {}
+                ("NO", Err(Error::No(reply))) | ("BAD", Err(Error::Bad(reply))) => {
+                    assert_eq!(reply.code.as_deref(), Some("ALERT"));
+                    assert_eq!(reply.text, "Maintenance tonight");
+                }
+                _ => panic!("completion status must be preserved"),
+            }
+            assert!(fetches.try_next().await.unwrap().is_none());
+            let UnsolicitedResponse::Other(alert) = recv.try_recv().unwrap() else {
+                panic!("completion ALERT must be forwarded");
+            };
+            assert!(matches!(
+                alert.parsed(),
+                Response::Done {
+                    code: Some(imap_proto::ResponseCode::Alert),
+                    information: Some(text),
+                    ..
+                } if text == "Maintenance tonight"
+            ));
+            assert!(recv.is_empty(), "forward the ALERT only once");
+        }
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn parse_fetches_distinguishes_absent_empty_and_set_flags() {
+        let (send, _recv) = bounded(10);
+        let responses = input_stream(&[
+            "* 1 FETCH (UID 10)\r\n",
+            "* 1 FETCH (FLAGS ())\r\n",
+            "* 1 FETCH (FLAGS (\\Seen))\r\n",
+            "a OK FETCH completed\r\n",
+        ]);
+        let mut stream = async_std::stream::from_iter(responses);
+        let fetches = parse_fetches(&mut stream, send, RequestId("a".into()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(!fetches[0].has_flags());
+        assert!(fetches[1].has_flags());
+        assert!(fetches[2].has_flags());
+        assert_eq!(fetches[0].flags().count(), 0);
+        assert_eq!(fetches[1].flags().count(), 0);
+        assert_eq!(fetches[2].flags().collect::<Vec<_>>(), [Flag::Seen]);
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]

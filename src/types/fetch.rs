@@ -68,6 +68,18 @@ impl Fetch {
         }
     }
 
+    /// Whether this response contains FLAGS, including an empty `FLAGS ()`.
+    /// A response without FLAGS must not clear flags received earlier.
+    pub fn has_flags(&self) -> bool {
+        if let Response::Fetch(_, attrs) = self.response.parsed() {
+            attrs
+                .iter()
+                .any(|attr| matches!(attr, AttributeValue::Flags(_)))
+        } else {
+            unreachable!()
+        }
+    }
+
     /// A list of flags that are set for this message.
     pub fn flags(&self) -> impl Iterator<Item = Flag<'_>> {
         if let Response::Fetch(_, attrs) = self.response.parsed() {
