@@ -380,11 +380,12 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
                         }
                         Ok(())
                     }
-                    Status::Bad => Err(Error::Bad(StatusResponse::new(
-                        code.as_ref(),
-                        information.as_deref(),
-                    ))),
-                    Status::No => Err(Error::No(StatusResponse::new(
+                    // An untagged NO or BAD is a warning about the mailbox,
+                    // not the answer to the command: RFC 3501 section 7.1.2
+                    // leaves that to the tagged completion.
+                    Status::No | Status::Bad => Ok(()),
+                    // The server is closing the connection and says why.
+                    Status::Bye => Err(Error::Bye(StatusResponse::new(
                         code.as_ref(),
                         information.as_deref(),
                     ))),

@@ -429,39 +429,46 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
             let Some(res) = ok_or_unauth_client_err!(self.read_response().await, self) else {
                 return Err((Error::ConnectionLost, self));
             };
-            match res.parsed() {
-                Response::Continue { information, .. } => {
-                    let challenge = if let Some(text) = information {
-                        ok_or_unauth_client_err!(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(text.as_ref())
-                                .map_err(|e| Error::Parse(ParseError::Authentication(
-                                    (*text).to_string(),
-                                    Some(e)
-                                ))),
-                            self
-                        )
-                    } else {
-                        Vec::new()
-                    };
-                    let raw_response = &mut authenticator.process(&challenge);
-                    let auth_response =
-                        base64::engine::general_purpose::STANDARD.encode(raw_response);
+            let challenge = match res.parsed() {
+                Response::Continue { information, .. } => Some(match information {
+                    Some(text) => ok_or_unauth_client_err!(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(text.as_ref())
+                            .map_err(|e| Error::Parse(ParseError::Authentication(
+                                (*text).to_string(),
+                                Some(e)
+                            ))),
+                        self
+                    ),
+                    None => Vec::new(),
+                }),
+                _ => None,
+            };
+            if let Some(challenge) = challenge {
+                let raw_response = &mut authenticator.process(&challenge);
+                let auth_response = base64::engine::general_purpose::STANDARD.encode(raw_response);
 
-                    ok_or_unauth_client_err!(
-                        self.conn.run_command_untagged(&auth_response).await,
-                        self
-                    );
-                }
-                _ => {
-                    ok_or_unauth_client_err!(
-                        self.check_done_ok_from(&id, Some(unsolicited_tx.clone()), res)
-                            .await,
-                        self
-                    );
-                    return Ok(self.into_session());
-                }
+                ok_or_unauth_client_err!(
+                    self.conn.run_command_untagged(&auth_response).await,
+                    self
+                );
+                continue;
             }
+            // Only the tagged completion ends the exchange. An untagged
+            // response, such as an ALERT, may arrive before the server asks
+            // for the next part, and waiting for the completion there would
+            // leave both sides waiting for each other.
+            let completed = matches!(res.parsed(), Response::Done { tag, .. } if tag == &id);
+            if !completed {
+                handle_unilateral(res, unsolicited_tx.clone());
+                continue;
+            }
+            ok_or_unauth_client_err!(
+                self.check_done_ok_from(&id, Some(unsolicited_tx.clone()), res)
+                    .await,
+                self
+            );
+            return Ok(self.into_session());
         }
     }
 }
@@ -1617,6 +1624,16 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
                         None
                     }
                 }
+                Response::Data {
+                    status: imap_proto::Status::Bye,
+                    code,
+                    information,
+                } => {
+                    return Err(Error::Bye(StatusResponse::new(
+                        code.as_ref(),
+                        information.as_deref(),
+                    )));
+                }
                 _ => None,
             };
             if let Some((status, alert)) = completion {
@@ -1852,6 +1869,44 @@ mod tests {
             &session.stream.inner.written_buf,
             command.as_bytes(),
             "Invalid authenticate command"
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn authenticate_after_an_untagged_response() {
+        // A server may send an ALERT before it asks for the credentials.
+        let response =
+            b"* OK [ALERT] Maintenance tonight\r\n+ YmFy\r\nA0001 OK Logged in\r\n".to_vec();
+        let command = "A0001 AUTHENTICATE PLAIN\r\nZm9v\r\n";
+        let mock_stream = MockStream::new(response);
+        let client = mock_client!(mock_stream);
+        enum Authenticate {
+            Auth,
+        }
+        impl Authenticator for &Authenticate {
+            type Response = Vec<u8>;
+            fn process(&mut self, challenge: &[u8]) -> Self::Response {
+                assert!(challenge == b"bar", "Invalid authenticate challenge");
+                b"foo".to_vec()
+            }
+        }
+        let session = client
+            .authenticate("PLAIN", &Authenticate::Auth)
+            .await
+            .ok()
+            .unwrap();
+        assert_eq_bytes!(
+            &session.stream.inner.written_buf,
+            command.as_bytes(),
+            "Invalid authenticate command"
+        );
+        let alert = session.unsolicited_responses.try_recv().unwrap();
+        assert!(
+            matches!(&alert, UnsolicitedResponse::Other(data)
+                if matches!(data.parsed(), Response::Data { status: imap_proto::Status::Ok, .. })),
+            "{alert:?}"
         );
     }
 
@@ -2380,6 +2435,39 @@ mod tests {
             "Invalid examine command"
         );
         assert_eq!(mailbox, expected_mailbox);
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn select_after_an_untagged_no() {
+        // An untagged NO is a warning; the tagged completion still decides.
+        let response =
+            b"* 1 EXISTS\r\n* NO [ALERT] Mailbox is almost full\r\nA0001 OK [READ-ONLY] Select completed.\r\n"
+                .to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+        let mailbox = session.select("INBOX").await.unwrap();
+        assert_eq!(mailbox.exists, 1);
+        let alert = session.unsolicited_responses.try_recv().unwrap();
+        assert!(
+            matches!(&alert, UnsolicitedResponse::Other(data)
+                if matches!(data.parsed(), Response::Data { status: imap_proto::Status::No, .. })),
+            "{alert:?}"
+        );
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn select_interrupted_by_a_bye_keeps_its_reason() {
+        let response = b"* 1 EXISTS\r\n* BYE Server is shutting down\r\n".to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+        match session.select("INBOX").await {
+            Err(Error::Bye(status)) => assert_eq!(status.text, "Server is shutting down"),
+            other => panic!("expected a BYE with its reason, got {other:?}"),
+        }
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]

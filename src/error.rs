@@ -23,6 +23,9 @@ pub enum Error {
     /// A NO response from the IMAP server.
     #[error("no response: {0}")]
     No(StatusResponse),
+    /// A BYE response: the server is closing the connection and says why.
+    #[error("bye response: {0}")]
+    Bye(StatusResponse),
     /// The connection was terminated unexpectedly.
     #[error("connection lost")]
     ConnectionLost,
