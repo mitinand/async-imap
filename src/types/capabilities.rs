@@ -1,12 +1,18 @@
 use imap_proto::types::Capability as CapabilityRef;
 use std::collections::HashSet;
 use std::collections::hash_set::Iter;
+use std::hash::{Hash, Hasher};
 
 const IMAP4REV1_CAPABILITY: &str = "IMAP4rev1";
 const AUTH_CAPABILITY_PREFIX: &str = "AUTH=";
 
 /// List of available Capabilities.
-#[derive(Debug, Eq, PartialEq, Hash)]
+///
+/// Capability names are atoms, which [RFC 3501 section
+/// 9](https://tools.ietf.org/html/rfc3501#section-9) compares without regard
+/// to case, so `STARTTLS` and `starttls` are the same capability. The name is
+/// kept as the server sent it.
+#[derive(Debug)]
 pub enum Capability {
     /// The crucial imap capability.
     Imap4rev1,
@@ -14,6 +20,46 @@ pub enum Capability {
     Auth(String),
     /// Any other atoms.
     Atom(String),
+}
+
+impl PartialEq for Capability {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Capability::Imap4rev1, Capability::Imap4rev1) => true,
+            (Capability::Auth(ours), Capability::Auth(theirs))
+            | (Capability::Atom(ours), Capability::Atom(theirs)) => {
+                ours.eq_ignore_ascii_case(theirs)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Capability {}
+
+impl Hash for Capability {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // The discriminant and the lower-case name, so that names differing
+        // only in case reach the same bucket as they compare equal.
+        match self {
+            Capability::Imap4rev1 => 0_u8.hash(state),
+            Capability::Auth(name) => {
+                1_u8.hash(state);
+                hash_ignoring_case(name, state);
+            }
+            Capability::Atom(name) => {
+                2_u8.hash(state);
+                hash_ignoring_case(name, state);
+            }
+        }
+    }
+}
+
+fn hash_ignoring_case<H: Hasher>(name: &str, state: &mut H) {
+    name.len().hash(state);
+    for byte in name.bytes() {
+        byte.to_ascii_lowercase().hash(state);
+    }
 }
 
 impl From<&CapabilityRef<'_>> for Capability {
@@ -87,5 +133,46 @@ impl Capabilities {
     /// Returns true if the server purports to have no capabilities.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capabilities(names: &[&str]) -> Capabilities {
+        Capabilities(
+            names
+                .iter()
+                .map(|name| Capability::Atom((*name).to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn capability_names_are_compared_without_regard_to_case() {
+        let announced = capabilities(&["starttls", "LoginDisabled"]);
+        assert!(announced.has_str("STARTTLS"));
+        assert!(announced.has_str("LOGINDISABLED"));
+        assert!(announced.has_str("logindisabled"));
+        assert!(!announced.has_str("IDLE"));
+    }
+
+    #[test]
+    fn authentication_mechanisms_are_compared_without_regard_to_case() {
+        let announced = Capabilities(
+            [Capability::Auth("plain".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(announced.has_str("AUTH=PLAIN"));
+        assert!(announced.has_str("auth=plain"));
+        assert!(!announced.has_str("AUTH=LOGIN"));
+    }
+
+    #[test]
+    fn a_repeated_name_in_another_case_is_one_capability() {
+        let announced = capabilities(&["IDLE", "idle"]);
+        assert_eq!(announced.len(), 1);
     }
 }

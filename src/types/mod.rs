@@ -157,17 +157,23 @@ pub enum Flag<'a> {
 }
 
 impl Flag<'static> {
+    /// Recognizes a system flag. Flag names are atoms, which [RFC 3501 section
+    /// 9](https://tools.ietf.org/html/rfc3501#section-9) compares without
+    /// regard to case, so `\\Seen` and `\\seen` are the same flag.
     fn system(s: &str) -> Option<Self> {
-        match s {
-            "\\Seen" => Some(Flag::Seen),
-            "\\Answered" => Some(Flag::Answered),
-            "\\Flagged" => Some(Flag::Flagged),
-            "\\Deleted" => Some(Flag::Deleted),
-            "\\Draft" => Some(Flag::Draft),
-            "\\Recent" => Some(Flag::Recent),
-            "\\*" => Some(Flag::MayCreate),
-            _ => None,
-        }
+        let known = [
+            ("\\Seen", Flag::Seen),
+            ("\\Answered", Flag::Answered),
+            ("\\Flagged", Flag::Flagged),
+            ("\\Deleted", Flag::Deleted),
+            ("\\Draft", Flag::Draft),
+            ("\\Recent", Flag::Recent),
+            ("\\*", Flag::MayCreate),
+        ];
+        known
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(s))
+            .map(|(_, flag)| flag)
     }
 }
 
@@ -188,6 +194,29 @@ impl<'a> From<&'a str> for Flag<'a> {
         } else {
             Flag::Custom(Cow::Borrowed(s))
         }
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::Flag;
+
+    #[test]
+    fn system_flag_names_are_recognized_in_any_case() {
+        for name in ["\\Seen", "\\seen", "\\SEEN"] {
+            assert_eq!(Flag::from(name.to_string()), Flag::Seen, "{name}");
+        }
+        assert_eq!(Flag::from("\\deleted".to_string()), Flag::Deleted);
+        assert_eq!(Flag::from("\\*".to_string()), Flag::MayCreate);
+    }
+
+    #[test]
+    fn a_keyword_of_the_mailbox_stays_custom() {
+        assert!(matches!(Flag::from("$label1".to_string()), Flag::Custom(_)));
+        assert!(matches!(
+            Flag::from("\\Unknown".to_string()),
+            Flag::Custom(_)
+        ));
     }
 }
 
