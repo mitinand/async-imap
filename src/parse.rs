@@ -16,30 +16,22 @@ pub(crate) fn parse_names<T: Stream<Item = io::Result<ResponseData>> + Unpin + S
     unsolicited: channel::Sender<UnsolicitedResponse>,
     command_tag: RequestId,
 ) -> impl Stream<Item = Result<Name>> + '_ + Send + Unpin {
-    use futures_util::{FutureExt, StreamExt};
-
-    StreamExt::filter_map(
-        StreamExt::take_while(stream, move |res| filter(res, &command_tag)),
-        move |resp| {
-            let unsolicited = unsolicited.clone();
-            async move {
-                match resp {
-                    Ok(resp) => match resp.parsed() {
-                        Response::MailboxData(MailboxDatum::List { .. }) => {
-                            let name = Name::from_mailbox_data(resp);
-                            Some(Ok(name))
-                        }
-                        _ => {
-                            handle_unilateral(resp, unsolicited);
-                            None
-                        }
-                    },
-                    Err(err) => Some(Err(err.into())),
-                }
+    CommandResponses {
+        stream,
+        unsolicited,
+        command_tag,
+        completed: false,
+        take_item: |response| {
+            if matches!(
+                response.parsed(),
+                Response::MailboxData(MailboxDatum::List { .. })
+            ) {
+                Ok(Name::from_mailbox_data(response))
+            } else {
+                Err(response)
             }
-            .boxed()
         },
-    )
+    }
 }
 
 pub(crate) fn filter(
@@ -68,27 +60,40 @@ pub(crate) fn parse_fetches<T: Stream<Item = io::Result<ResponseData>> + Unpin +
     unsolicited: channel::Sender<UnsolicitedResponse>,
     command_tag: RequestId,
 ) -> impl Stream<Item = Result<Fetch>> + '_ + Send + Unpin {
-    FetchResponses {
+    CommandResponses {
         stream,
         unsolicited,
         command_tag,
         completed: false,
+        take_item: |response| {
+            if matches!(response.parsed(), Response::Fetch(..)) {
+                Ok(Fetch::new(response))
+            } else {
+                Err(response)
+            }
+        },
     }
 }
 
-/// FETCH responses until the command's completion. A NO or BAD completion,
-/// which a server can send after answering for some of the messages, or a
+/// The FETCH or LIST responses of one command until its completion. A NO or
+/// BAD completion, which a server can send after answering in part, or a
 /// connection closed before the completion ends the stream with an error
-/// after the responses received before it.
-struct FetchResponses<'a, T> {
+/// after the responses received before it, so that a partial answer never
+/// looks complete.
+struct CommandResponses<'a, T, Item> {
     stream: &'a mut T,
     unsolicited: channel::Sender<UnsolicitedResponse>,
     command_tag: RequestId,
     completed: bool,
+    /// The command's own response as an item; any other response is given
+    /// back and handled as unilateral.
+    take_item: fn(ResponseData) -> std::result::Result<Item, ResponseData>,
 }
 
-impl<T: Stream<Item = io::Result<ResponseData>> + Unpin> Stream for FetchResponses<'_, T> {
-    type Item = Result<Fetch>;
+impl<T: Stream<Item = io::Result<ResponseData>> + Unpin, Item> Stream
+    for CommandResponses<'_, T, Item>
+{
+    type Item = Result<Item>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
@@ -103,9 +108,12 @@ impl<T: Stream<Item = io::Result<ResponseData>> + Unpin> Stream for FetchRespons
                 Ok(response) => response,
                 Err(error) => return Poll::Ready(Some(Err(error.into()))),
             };
+            let response = match (this.take_item)(response) {
+                Ok(item) => return Poll::Ready(Some(Ok(item))),
+                Err(response) => response,
+            };
             // `Some` for this command's completion, holding its error, if any.
             let completion = match response.parsed() {
-                Response::Fetch(..) => return Poll::Ready(Some(Ok(Fetch::new(response)))),
                 Response::Done {
                     tag,
                     status,
@@ -603,7 +611,10 @@ mod tests {
     #[cfg_attr(feature = "runtime-futures", async_std::test)]
     async fn parse_names_test() {
         let (send, recv) = bounded(10);
-        let responses = input_stream(&["* LIST (\\HasNoChildren) \".\" \"INBOX\"\r\n"]);
+        let responses = input_stream(&[
+            "* LIST (\\HasNoChildren) \".\" \"INBOX\"\r\n",
+            "A0001 OK LIST completed\r\n",
+        ]);
         let mut stream = async_std::stream::from_iter(responses);
 
         let id = RequestId("A0001".into());
@@ -619,6 +630,38 @@ mod tests {
         );
         assert_eq!(names[0].delimiter(), Some("."));
         assert_eq!(names[0].name(), "INBOX");
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "runtime-futures", async_std::test)]
+    async fn parse_names_reports_a_refused_or_unfinished_list_after_its_names() {
+        let name = "* LIST (\\HasNoChildren) \"/\" \"Sent\"\r\n";
+        // A refusal after some names, and a connection closed before the
+        // completion, must not look like a complete list.
+        for ending in [
+            Some("A0001 NO [UNAVAILABLE] Try again later\r\n"),
+            Some("A0001 BAD Invalid pattern\r\n"),
+            None,
+        ] {
+            let (send, _recv) = bounded(10);
+            let lines: Vec<&str> = std::iter::once(name).chain(ending).collect();
+            let mut stream = async_std::stream::from_iter(input_stream(&lines));
+            let mut names = parse_names(&mut stream, send, RequestId("A0001".into()));
+            assert_eq!(names.try_next().await.unwrap().unwrap().name(), "Sent");
+            match (ending, names.try_next().await) {
+                (Some(line), Err(Error::No(reply))) if line.contains(" NO ") => {
+                    assert_eq!(reply.code.as_deref(), Some("UNAVAILABLE"));
+                    assert_eq!(reply.text, "Try again later");
+                }
+                (Some(line), Err(Error::Bad(reply))) if line.contains(" BAD ") => {
+                    assert_eq!(reply.text, "Invalid pattern");
+                }
+                (None, Err(Error::ConnectionLost)) => {}
+                (ending, _) => panic!("the ending {ending:?} must be reported"),
+            }
+            assert!(names.try_next().await.unwrap().is_none());
+        }
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
@@ -832,6 +875,7 @@ mod tests {
         let responses = input_stream(&[
             "* LIST (\\HasNoChildren) \".\" \"INBOX\"\r\n",
             "* 4 EXPUNGE\r\n",
+            "A0001 OK LIST completed\r\n",
         ]);
         let mut stream = async_std::stream::from_iter(responses);
 
